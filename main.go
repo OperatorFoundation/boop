@@ -5,14 +5,17 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"math"
 	"net"
 	"os"
 	"os/exec"
-	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/faiface/beep"
+	"github.com/faiface/beep/speaker"
 	"github.com/grandcat/zeroconf"
 )
 
@@ -27,9 +30,14 @@ var (
 )
 
 const (
-	version     = "0.3.0"
+	version     = "0.4.0"
 	boopPort    = 9999
 	serviceType = "_boop._udp"
+)
+
+var (
+	speakerInitialized bool
+	speakerMutex       sync.Mutex
 )
 
 // TailscaleStatus represents the JSON output from tailscale status
@@ -226,63 +234,140 @@ func resolveTailscaleHost(target string) (string, error) {
 }
 
 func playBoopSound() {
-	switch runtime.GOOS {
-	case "darwin":
-		// Try to use sox for a nice synthesized boop
-		cmd := exec.Command("play", "-n", "synth", "0.15", "sine", "500-300",
-			"fade", "h", "0.01", "0.15", "0.08", "gain", "-3")
-		cmd.Stdout = nil
-		cmd.Stderr = nil
-		if err := cmd.Run(); err != nil {
-			// Fall back to system sounds
-			sounds := []string{
-				"/System/Library/Sounds/Bottle.aiff",
-				"/System/Library/Sounds/Pop.aiff",
-				"/System/Library/Sounds/Submarine.aiff",
-			}
-			for _, sound := range sounds {
-				if _, err := os.Stat(sound); err == nil {
-					cmd := exec.Command("afplay", sound)
-					cmd.Stdout = nil
-					cmd.Stderr = nil
-					cmd.Run()
-					break
-				}
-			}
-		}
-	case "linux":
-		sounds := []string{
-			"/usr/share/sounds/freedesktop/stereo/message.oga",
-			"/usr/share/sounds/freedesktop/stereo/bell.oga",
-			"/usr/share/sounds/gnome/default/alerts/drip.ogg",
-			"/usr/share/sounds/ubuntu/stereo/message.ogg",
-		}
-		soundPlayed := false
-		for _, sound := range sounds {
-			if _, err := os.Stat(sound); err == nil {
-				// Try paplay first
-				cmd := exec.Command("paplay", sound)
-				cmd.Stdout = nil
-				cmd.Stderr = nil
-				if err := cmd.Run(); err == nil {
-					soundPlayed = true
-					break
-				}
-				// Try aplay
-				cmd = exec.Command("aplay", "-q", sound)
-				cmd.Stdout = nil
-				cmd.Stderr = nil
-				if err := cmd.Run(); err == nil {
-					soundPlayed = true
-					break
-				}
-			}
-		}
-		if !soundPlayed {
-			// Terminal bell
-			fmt.Print("\a")
-		}
+	// Initialize speaker once
+	speakerMutex.Lock()
+	if !speakerInitialized {
+		sr := beep.SampleRate(44100)
+		speaker.Init(sr, sr.N(time.Millisecond*100))
+		speakerInitialized = true
 	}
+	speakerMutex.Unlock()
+
+	// Generate the boop sound
+	sr := beep.SampleRate(44100)
+	duration := sr.N(time.Millisecond * 150)
+
+	// Create a frequency sweep from 500Hz to 300Hz
+	sweepStreamer := &FrequencySweep{
+		SampleRate: sr,
+		StartFreq:  500,
+		EndFreq:    300,
+		Duration:   duration,
+		Position:   0,
+	}
+
+	// Apply envelope (quick attack, longer decay)
+	envelope := &Envelope{
+		Streamer:    beep.Take(duration, sweepStreamer),
+		AttackTime:  sr.N(time.Millisecond * 10),
+		DecayTime:   sr.N(time.Millisecond * 80),
+		TotalLength: duration,
+		Position:    0,
+	}
+
+	// Reduce volume slightly
+	volume := &VolumeControl{
+		Streamer: envelope,
+		Volume:   0.5, // 50% volume
+	}
+
+	speaker.Play(volume)
+}
+
+// FrequencySweep generates a sine wave that sweeps from one frequency to another
+type FrequencySweep struct {
+	SampleRate beep.SampleRate
+	StartFreq  float64
+	EndFreq    float64
+	Duration   int
+	Position   int
+}
+
+func (s *FrequencySweep) Stream(samples [][2]float64) (n int, ok bool) {
+	for i := range samples {
+		if s.Position >= s.Duration {
+			return i, false
+		}
+
+		// Calculate current frequency (linear interpolation)
+		progress := float64(s.Position) / float64(s.Duration)
+		freq := s.StartFreq + (s.EndFreq-s.StartFreq)*progress
+
+		// Generate sine wave at current frequency
+		phase := 2 * math.Pi * freq * float64(s.Position) / float64(s.SampleRate)
+		sample := math.Sin(phase)
+
+		samples[i][0] = sample
+		samples[i][1] = sample
+		s.Position++
+		n++
+	}
+	return n, true
+}
+
+func (s *FrequencySweep) Err() error {
+	return nil
+}
+
+// Envelope applies an attack-decay envelope to the audio
+type Envelope struct {
+	Streamer    beep.Streamer
+	AttackTime  int
+	DecayTime   int
+	TotalLength int
+	Position    int
+}
+
+func (e *Envelope) Stream(samples [][2]float64) (n int, ok bool) {
+	n, ok = e.Streamer.Stream(samples)
+
+	for i := 0; i < n; i++ {
+		if e.Position >= e.TotalLength {
+			return i, false
+		}
+
+		var gain float64
+		if e.Position < e.AttackTime {
+			// Attack phase - fade in
+			gain = float64(e.Position) / float64(e.AttackTime)
+		} else if e.Position > e.TotalLength-e.DecayTime {
+			// Decay phase - fade out
+			remaining := e.TotalLength - e.Position
+			gain = float64(remaining) / float64(e.DecayTime)
+		} else {
+			// Sustain phase
+			gain = 1.0
+		}
+
+		samples[i][0] *= gain
+		samples[i][1] *= gain
+		e.Position++
+	}
+
+	return n, ok
+}
+
+func (e *Envelope) Err() error {
+	return e.Streamer.Err()
+}
+
+// VolumeControl applies volume control to the audio
+type VolumeControl struct {
+	Streamer beep.Streamer
+	Volume   float64 // 0.0 to 1.0
+}
+
+func (v *VolumeControl) Stream(samples [][2]float64) (n int, ok bool) {
+	n, ok = v.Streamer.Stream(samples)
+	for i := 0; i < n; i++ {
+		samples[i][0] *= v.Volume
+		samples[i][1] *= v.Volume
+	}
+	return n, ok
+}
+
+func (v *VolumeControl) Err() error {
+	return v.Streamer.Err()
 }
 
 func listenForBoops() error {
