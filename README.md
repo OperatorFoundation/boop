@@ -4,12 +4,12 @@ A simple UDP notification tool for Tailscale/Headscale networks.
 
 ## Features
 
-- 🔊 Send and receive audio notifications across your network
-- 🌐 IPv4 and IPv6 support
-- 🔍 mDNS service discovery
-- 🎯 Tailscale/Headscale integration with automatic hostname and username resolution
-- 🎨 Beautiful terminal output with Catppuccin Mocha color scheme
-- 📡 Fallback Tailscale resolution when MagicDNS isn't available
+- Send and receive audio notifications across your network
+- IPv4 and IPv6 support
+- mDNS service discovery
+- Tailscale/Headscale integration with automatic hostname and username resolution
+- Beautiful terminal output with Catppuccin Mocha color scheme
+- Fallback Tailscale resolution when MagicDNS isn't available
 
 ## Installation
 
@@ -80,11 +80,6 @@ The tool will automatically:
 
 It works with both official Tailscale and Headscale installations.
 
-### Sound playback
-
-- **macOS**: Uses `sox` (`play` command) to synthesize a nice boop sound, falling back to system sounds
-- **Linux**: Tries `paplay` (PulseAudio) or `aplay` (ALSA) with system notification sounds, falling back to terminal bell
-
 ### Colors
 
 The Catppuccin Mocha color palette: https://catppuccin.com
@@ -93,9 +88,6 @@ The Catppuccin Mocha color palette: https://catppuccin.com
 
 - Go 1.21 or later
 - Tailscale or Headscale client (optional, for hostname resolution)
-- Audio support:
-  - macOS: `sox` (optional, for nice boop sound) or built-in `afplay`
-  - Linux: `paplay` or `aplay`
 
 ## Port
 
