@@ -9,24 +9,16 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/faiface/beep"
 	"github.com/faiface/beep/speaker"
 	"github.com/grandcat/zeroconf"
-)
-
-var (
-	// Catppuccin Mocha color palette
-	successStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#a6e3a1"))            // Green
-	infoStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("#89b4fa"))            // Blue
-	mutedStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#6c7086"))            // Surface2
-	userStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("#89dceb")).Bold(true) // Sky
-	hostStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("#cba6f7"))            // Mauve
-	messageStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#cdd6f4"))            // Text
 )
 
 const (
@@ -38,6 +30,19 @@ const (
 var (
 	speakerInitialized bool
 	speakerMutex       sync.Mutex
+)
+
+var (
+	// Catppuccin Mocha color palette
+	successStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#a6e3a1"))            // Green
+	infoStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("#89b4fa"))            // Blue
+	mutedStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#6c7086"))            // Surface2
+	userStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("#89dceb")).Bold(true) // Sky
+	hostStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("#cba6f7"))            // Mauve
+	messageStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#cdd6f4"))            // Text
+	onlineStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("#a6e3a1"))            // Green
+	offlineStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#f38ba8"))            // Red
+	titleStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#cba6f7")).Bold(true)
 )
 
 // TailscaleStatus represents the JSON output from tailscale status
@@ -77,6 +82,32 @@ type TailscaleInfo struct {
 	Online   bool
 }
 
+type Machine struct {
+	Name   string
+	User   string
+	IP     string
+	Online bool
+}
+
+type BoopMessage struct {
+	From    string
+	Message string
+	Time    time.Time
+}
+
+type model struct {
+	machines []Machine
+	boops    []BoopMessage
+	hostname string
+	myIP     string
+	port     int
+	err      error
+}
+
+type tickMsg time.Time
+type boopReceivedMsg BoopMessage
+type machinesUpdateMsg []Machine
+
 func getHostname() string {
 	hostname, err := os.Hostname()
 	if err != nil {
@@ -89,8 +120,13 @@ func getTailscaleStatus() (*TailscaleStatus, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "tailscale", "status", "--json")
-	output, err := cmd.Output()
+	cmd := "tailscale"
+	args := []string{"status", "--json"}
+
+	// Use exec.CommandContext but we need os/exec
+	execCmd := exec.Command(cmd, args...)
+	execCmd = exec.CommandContext(ctx, cmd, args...)
+	output, err := execCmd.Output()
 	if err != nil {
 		return nil, err
 	}
@@ -268,7 +304,7 @@ func playBoopSound() {
 	// Reduce volume slightly
 	volume := &VolumeControl{
 		Streamer: envelope,
-		Volume:   0.5, // 50% volume
+		Volume:   0.5,
 	}
 
 	speaker.Play(volume)
@@ -354,7 +390,7 @@ func (e *Envelope) Err() error {
 // VolumeControl applies volume control to the audio
 type VolumeControl struct {
 	Streamer beep.Streamer
-	Volume   float64 // 0.0 to 1.0
+	Volume   float64
 }
 
 func (v *VolumeControl) Stream(samples [][2]float64) (n int, ok bool) {
@@ -370,17 +406,228 @@ func (v *VolumeControl) Err() error {
 	return v.Streamer.Err()
 }
 
+func initialModel() model {
+	return model{
+		machines: []Machine{},
+		boops:    []BoopMessage{},
+		port:     boopPort,
+	}
+}
+
+func (m model) Init() tea.Cmd {
+	return tea.Batch(
+		tickCmd(),
+		updateMachinesCmd(),
+	)
+}
+
+func tickCmd() tea.Cmd {
+	return tea.Tick(time.Minute, func(t time.Time) tea.Msg {
+		return tickMsg(t)
+	})
+}
+
+func updateMachinesCmd() tea.Cmd {
+	return func() tea.Msg {
+		status, err := getTailscaleStatus()
+		if err != nil {
+			return machinesUpdateMsg([]Machine{})
+		}
+
+		var machines []Machine
+
+		// Add self
+		if status.Self.DNSName != "" || status.Self.HostName != "" {
+			name := strings.TrimSuffix(status.Self.DNSName, ".")
+			if name == "" {
+				name = status.Self.HostName
+			}
+			user := getUserName(status, status.Self.UserID)
+			ip := ""
+			if len(status.Self.TailscaleIPs) > 0 {
+				ip = status.Self.TailscaleIPs[0]
+			}
+			machines = append(machines, Machine{
+				Name:   name,
+				User:   user,
+				IP:     ip,
+				Online: true,
+			})
+		}
+
+		// Add peers
+		for _, peer := range status.Peer {
+			name := strings.TrimSuffix(peer.DNSName, ".")
+			if name == "" {
+				name = peer.HostName
+			}
+			user := peer.UserProfile.LoginName
+			if user == "" {
+				user = peer.UserProfile.DisplayName
+			}
+			if user == "" {
+				user = getUserName(status, peer.UserID)
+			}
+			ip := ""
+			if len(peer.TailscaleIPs) > 0 {
+				ip = peer.TailscaleIPs[0]
+			}
+			machines = append(machines, Machine{
+				Name:   name,
+				User:   user,
+				IP:     ip,
+				Online: peer.Online,
+			})
+		}
+
+		// Sort by name
+		sort.Slice(machines, func(i, j int) bool {
+			return machines[i].Name < machines[j].Name
+		})
+
+		return machinesUpdateMsg(machines)
+	}
+}
+
+func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		switch msg.String() {
+		case "ctrl+c", "q":
+			os.Exit(0)
+		}
+
+	case tickMsg:
+		return m, tea.Batch(tickCmd(), updateMachinesCmd())
+
+	case machinesUpdateMsg:
+		m.machines = msg
+		return m, nil
+
+	case boopReceivedMsg:
+		m.boops = append(m.boops, BoopMessage(msg))
+		// Keep only last 10 boops
+		if len(m.boops) > 10 {
+			m.boops = m.boops[len(m.boops)-10:]
+		}
+		return m, nil
+
+	case error:
+		m.err = msg
+		return m, nil
+	}
+
+	return m, nil
+}
+
+func (m model) View() string {
+	var s string
+
+	// Machines section
+	if len(m.machines) == 0 {
+		s += mutedStyle.Render("No machines found...") + "\n"
+	} else {
+		for _, machine := range m.machines {
+			status := "●"
+			statusStyle := offlineStyle
+			if machine.Online {
+				statusStyle = onlineStyle
+			}
+
+			// Use blue dot for current user
+			if machine.IP == m.myIP {
+				statusStyle = infoStyle
+			}
+
+			// Extract short hostname (before first dot)
+			shortName := machine.Name
+			if idx := strings.Index(shortName, "."); idx != -1 {
+				shortName = shortName[:idx]
+			}
+
+			if machine.User != "" {
+				s += fmt.Sprintf("%s %s%s%s\n",
+					statusStyle.Render(status),
+					userStyle.Render(machine.User),
+					mutedStyle.Render("@"),
+					hostStyle.Render(shortName))
+			} else {
+				s += fmt.Sprintf("%s %s\n",
+					statusStyle.Render(status),
+					hostStyle.Render(shortName))
+			}
+		}
+	}
+
+	// Boops section
+	s += "\n" + titleStyle.Render("Recent boops:") + "\n"
+	if len(m.boops) == 0 {
+		s += mutedStyle.Render("  No boops yet...") + "\n"
+	} else {
+		for _, boop := range m.boops {
+			timeStr := boop.Time.Format("15:04:05")
+			s += fmt.Sprintf("  %s %s",
+				mutedStyle.Render(timeStr),
+				successStyle.Render(boop.From))
+			if boop.Message != "" {
+				s += fmt.Sprintf(" %s", messageStyle.Render(boop.Message))
+			}
+			s += "\n"
+		}
+	}
+
+	s += "\n" + mutedStyle.Render("Press q or ctrl+c to quit")
+
+	return s
+}
+
 func listenForBoops() error {
-	// Get hostname (preferring Tailscale machine name)
+	// Get hostname and my IP
 	hostname := getHostname()
+	var myIP string
 	status, err := getTailscaleStatus()
 	if err == nil {
 		dnsName := strings.TrimSuffix(status.Self.DNSName, ".")
 		if dnsName != "" {
 			hostname = dnsName
 		}
+		if len(status.Self.TailscaleIPs) > 0 {
+			myIP = status.Self.TailscaleIPs[0]
+		}
 	}
 
+	// Start UDP listeners in background
+	boopChan := make(chan BoopMessage, 10)
+	go startUDPListeners(boopChan)
+
+	// Start mDNS
+	server, _ := zeroconf.Register(hostname, serviceType, "local.", boopPort, []string{"txtv=0"}, nil)
+	if server != nil {
+		defer server.Shutdown()
+	}
+
+	// Create TUI model
+	m := initialModel()
+	m.hostname = hostname
+	m.myIP = myIP
+
+	// Start Bubble Tea program with alt screen
+	p := tea.NewProgram(m, tea.WithAltScreen())
+
+	// Forward boop messages to the program
+	go func() {
+		for boop := range boopChan {
+			p.Send(boopReceivedMsg(boop))
+			go playBoopSound()
+		}
+	}()
+
+	// Run the program
+	p.Run()
+	return nil
+}
+
+func startUDPListeners(boopChan chan<- BoopMessage) {
 	// Listen on IPv4
 	addr4 := &net.UDPAddr{
 		Port: boopPort,
@@ -388,7 +635,7 @@ func listenForBoops() error {
 	}
 	conn4, err := net.ListenUDP("udp4", addr4)
 	if err != nil {
-		return fmt.Errorf("failed to listen on IPv4: %w", err)
+		return
 	}
 	defer conn4.Close()
 
@@ -397,109 +644,51 @@ func listenForBoops() error {
 		Port: boopPort,
 		IP:   net.IPv6zero,
 	}
-	conn6, err := net.ListenUDP("udp6", addr6)
-	if err != nil {
-		fmt.Printf("%s %s\n",
-			infoStyle.Render("Listening on port"),
-			infoStyle.Bold(true).Render(fmt.Sprintf("%d (IPv4 only)", boopPort)))
-	} else {
-		defer conn6.Close()
-		fmt.Printf("%s %s\n",
-			infoStyle.Render("Listening on port"),
-			infoStyle.Bold(true).Render(fmt.Sprintf("%d (IPv4 and IPv6)", boopPort)))
-	}
-
-	// Start mDNS advertisement
-	server, err := zeroconf.Register(hostname, serviceType, "local.", boopPort, []string{"txtv=0"}, nil)
-	if err != nil {
-		fmt.Printf("%s %v\n", mutedStyle.Render("Warning: Could not start mDNS advertisement:"), err)
-	} else {
-		defer server.Shutdown()
-		fmt.Printf("%s %s %s\n",
-			infoStyle.Render("Advertising as"),
-			hostStyle.Render(hostname),
-			mutedStyle.Render("via mDNS"))
-	}
-
-	// Channel to coordinate shutdown
-	done := make(chan bool)
-
-	// Handle IPv4 packets
-	go handleConnection(conn4, done)
-
-	// Handle IPv6 packets if available
+	conn6, _ := net.ListenUDP("udp6", addr6)
 	if conn6 != nil {
-		go handleConnection(conn6, done)
+		defer conn6.Close()
+		go handleUDPConnection(conn6, boopChan)
 	}
 
-	// Block forever - let default signal handling kill the process
-	select {}
+	handleUDPConnection(conn4, boopChan)
 }
 
-func handleConnection(conn *net.UDPConn, done chan bool) {
+func handleUDPConnection(conn *net.UDPConn, boopChan chan<- BoopMessage) {
 	buffer := make([]byte, 1024)
-	conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
 
 	for {
-		select {
-		case <-done:
+		conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+		n, addr, err := conn.ReadFromUDP(buffer)
+		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				continue
+			}
 			return
-		default:
-			conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
-			n, addr, err := conn.ReadFromUDP(buffer)
-			if err != nil {
-				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-					continue
-				}
-				return
-			}
+		}
 
-			message := strings.TrimSpace(string(buffer[:n]))
-			senderIP := addr.IP.String()
+		message := strings.TrimSpace(string(buffer[:n]))
+		senderIP := addr.IP.String()
 
-			// Normalize IPv6 addresses (remove zone identifier if present)
-			if idx := strings.Index(senderIP, "%"); idx != -1 {
-				senderIP = senderIP[:idx]
-			}
+		// Normalize IPv6 addresses
+		if idx := strings.Index(senderIP, "%"); idx != -1 {
+			senderIP = senderIP[:idx]
+		}
 
-			// Get Tailscale info
-			var senderDisplay string
-			tsInfo := getTailscaleInfo(senderIP)
-			if tsInfo != nil {
-				if tsInfo.User != "" {
-					senderDisplay = fmt.Sprintf("%s@%s [%s]", tsInfo.User, tsInfo.Name, senderIP)
-				} else {
-					senderDisplay = fmt.Sprintf("%s [%s]", tsInfo.Name, senderIP)
-				}
+		// Get Tailscale info
+		from := senderIP
+		tsInfo := getTailscaleInfo(senderIP)
+		if tsInfo != nil {
+			if tsInfo.User != "" {
+				from = fmt.Sprintf("%s@%s", tsInfo.User, tsInfo.Name)
 			} else {
-				// Try reverse DNS
-				names, err := net.LookupAddr(senderIP)
-				if err == nil && len(names) > 0 {
-					senderDisplay = fmt.Sprintf("%s [%s]", names[0], senderIP)
-				} else {
-					senderDisplay = fmt.Sprintf("[%s]", senderIP)
-				}
+				from = tsInfo.Name
 			}
+		}
 
-			// Play sound
-			go playBoopSound()
-
-			// Display message with styling
-			if tsInfo != nil && tsInfo.User != "" {
-				fmt.Printf("%s %s%s%s %s\n",
-					successStyle.Render("Boop from"),
-					userStyle.Render(tsInfo.User),
-					mutedStyle.Render("@"),
-					hostStyle.Render(tsInfo.Name),
-					mutedStyle.Render(fmt.Sprintf("[%s]", senderIP)))
-			} else {
-				fmt.Printf("%s %s\n",
-					successStyle.Render("Boop from"),
-					senderDisplay)
-			}
-			if message != "" {
-				fmt.Printf("  %s\n", messageStyle.Render(message))
-			}
+		boopChan <- BoopMessage{
+			From:    from,
+			Message: message,
+			Time:    time.Now(),
 		}
 	}
 }
