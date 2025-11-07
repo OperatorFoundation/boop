@@ -1,17 +1,18 @@
 package main
 
 import (
-	"encoding/json"
 	"os"
 	"path/filepath"
+
+	"github.com/BurntSushi/toml"
 )
 
 const defaultBytebeat = "t*(((t>>12)|(t>>8))&(63&(t>>4)))"
 
 type BoopConfig struct {
-	Bytebeat string  `json:"bytebeat"`
-	Duration int     `json:"duration_ms"` // Duration in milliseconds
-	Volume   float64 `json:"volume"`      // 0.0 to 1.0
+	Bytebeat string  `toml:"bytebeat"`
+	Duration int     `toml:"duration_ms"`
+	Volume   float64 `toml:"volume"`
 }
 
 func getConfigPath() string {
@@ -19,7 +20,7 @@ func getConfigPath() string {
 	if err != nil {
 		return ""
 	}
-	return filepath.Join(home, ".config", "boop", "config.json")
+	return filepath.Join(home, ".config", "boop", "config.toml")
 }
 
 func loadConfig() BoopConfig {
@@ -30,14 +31,17 @@ func loadConfig() BoopConfig {
 	}
 
 	configPath := getConfigPath()
-	data, err := os.ReadFile(configPath)
-	if err != nil {
-		// Config doesn't exist, create default
+	if _, err := os.Stat(configPath); os.IsNotExist(err) {
 		saveDefaultConfig()
 		return config
 	}
 
-	json.Unmarshal(data, &config)
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return config
+	}
+
+	toml.Unmarshal(data, &config)
 	return config
 }
 
@@ -54,10 +58,11 @@ func saveDefaultConfig() error {
 		return err
 	}
 
-	data, err := json.MarshalIndent(config, "", "  ")
+	f, err := os.Create(configPath)
 	if err != nil {
 		return err
 	}
+	defer f.Close()
 
-	return os.WriteFile(configPath, data, 0644)
+	return toml.NewEncoder(f).Encode(config)
 }
